@@ -13,13 +13,20 @@ CONFIG = {
 
 
 def post_json(url, headers, payload):
-    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={'Content-Type': 'application/json', **headers})
+    default_headers = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    }
+    req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={**default_headers, **headers})
     try:
         with urllib.request.urlopen(req, timeout=60) as response:
             return json.load(response)
     except urllib.error.HTTPError as exc:
-        # Do not print response bodies: they may contain account or request data.
-        raise RuntimeError(f'Provider trả HTTP {exc.code}; kiểm tra model, key và quota.') from exc
+        try:
+            err_msg = exc.read().decode('utf-8', errors='replace')[:300]
+        except Exception:
+            err_msg = ''
+        raise RuntimeError(f'Provider trả HTTP {exc.code}; chi tiết: {err_msg}') from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f'Không kết nối được provider: {exc.reason}') from exc
 
@@ -37,9 +44,17 @@ class Provider:
             raise ValueError('Cần đặt MODEL là model có hỗ trợ tool calling.')
         self.name, self.model = name, model
         key_name, self.url = CONFIG[name]
-        self.key = os.getenv(key_name)
-        if not self.key:
+        raw_key = os.getenv(key_name) or os.getenv('API_KEY')
+        if not raw_key:
             raise ValueError(f'Thiếu {key_name}; xem README.md.')
+        self.key = raw_key.strip('"\'')
+        # Tự động chuyển sang endpoint OpenCode nếu key có prefix oc_sk_
+        if name == 'openai':
+            base_url = os.getenv('OPENAI_BASE_URL')
+            if base_url:
+                self.url = base_url
+            elif self.key.startswith('oc_sk_'):
+                self.url = 'https://opencode.ai/inference/openai/v1/chat/completions'
 
     def complete(self, messages, schemas):
         if self.name == 'anthropic':
@@ -47,7 +62,8 @@ class Provider:
         payload = {'model': self.model, 'messages': messages}
         if schemas:
             payload['tools'] = schemas
-        data = post_json(self.url, {'Authorization': f'Bearer {self.key}'}, payload)
+        headers = {'Authorization': f'Bearer {self.key}'}
+        data = post_json(self.url, headers, payload)
         choice = data['choices'][0]
         message = choice['message']
         calls = [{'id': c['id'], 'name': c['function']['name'], 'arguments': c['function']['arguments']} for c in message.get('tool_calls', [])]
